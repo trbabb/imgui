@@ -150,6 +150,8 @@ static int RunInteractive()
     ImVec2 view_pivot_manual  = ImVec2(400.0f, 300.0f);
     bool   view_enable        = true;
     bool   pivot_on_cursor    = true;   // good default: zoom around the mouse cursor
+    bool   nest_enable        = false;
+    float  nest_scale         = 1.0f;
 
     while (!glfwWindowShouldClose(window))
     {
@@ -163,7 +165,7 @@ static int RunInteractive()
 
         // Control panel (always at identity).
         ImGui::SetNextWindowPos(ImVec2(800, 20), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(360, 220), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(360, 320), ImGuiCond_FirstUseEver);
         ImGui::Begin("View Controls");
         ImGui::Checkbox("Apply view transform", &view_enable);
         ImGui::SliderFloat("scale", &view_scale, 0.25f, 4.0f, "%.3f");
@@ -175,13 +177,50 @@ static int RunInteractive()
         ImGui::TextDisabled("active pivot: (%.0f, %.0f)", pivot.x, pivot.y);
         ImGui::TextDisabled("composed: scale=%.3f offset=(%.1f, %.1f)",
                             ImGui::GetViewScale(), ImGui::GetViewOffset().x, ImGui::GetViewOffset().y);
+
+        ImGui::Separator();
+        ImGui::Checkbox("Nested view", &nest_enable);
+        ImGui::BeginDisabled(!nest_enable);
+        ImGui::SliderFloat("nest scale", &nest_scale, 0.25f, 4.0f, "%.3f");
+        ImGui::TextDisabled("predicted composed: %.3f", view_scale * nest_scale);
+        ImGui::EndDisabled();
         ImGui::TextDisabled("(PR 1: visual only — hit-test stays unscaled)");
         ImGui::End();
 
-        if (view_enable && view_scale != 1.0f)
+        const bool outer_active = view_enable && view_scale != 1.0f;
+        if (outer_active)
             ImGui::PushView(view_scale, pivot);
         ScaleHarness::RenderWidgetZoo();
-        if (view_enable && view_scale != 1.0f)
+
+        // Nested panel — mirrors the headless --nest-scale verification.
+        // Both views share the same screen pivot, so the panel stays
+        // centered there at any composed scale. The displayed
+        // composed=GetViewScale() should equal outer*inner exactly.
+        if (nest_enable && outer_active && nest_scale != 1.0f)
+        {
+            // Express the screen pivot in outer-local coordinates.
+            const float outer_offset_x = pivot.x * (1.0f - view_scale);
+            const float outer_offset_y = pivot.y * (1.0f - view_scale);
+            const ImVec2 inner_pivot_in_outer_local(
+                (pivot.x - outer_offset_x) / view_scale,
+                (pivot.y - outer_offset_y) / view_scale);
+            ImGui::PushView(nest_scale, inner_pivot_in_outer_local);
+
+            const ImVec2 panel_size(220.0f, 80.0f);
+            const ImVec2 panel_pos(inner_pivot_in_outer_local.x - panel_size.x * 0.5f,
+                                   inner_pivot_in_outer_local.y - panel_size.y * 0.5f);
+            ImGui::SetNextWindowPos(panel_pos, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(panel_size, ImGuiCond_Always);
+            ImGui::Begin("Nested", nullptr, ImGuiWindowFlags_NoSavedSettings);
+            ImGui::Text("outer=%.2f inner=%.2f", view_scale, nest_scale);
+            ImGui::Text("composed=%.3f expected=%.3f",
+                        ImGui::GetViewScale(), view_scale * nest_scale);
+            ImGui::End();
+
+            ImGui::PopView();
+        }
+
+        if (outer_active)
             ImGui::PopView();
 
         ImGui::Render();
