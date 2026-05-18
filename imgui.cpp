@@ -5916,6 +5916,202 @@ void ImGui::PopClipRect()
     window->ClipRect = window->DrawList->_ClipRectStack.back();
 }
 
+//-----------------------------------------------------------------------------
+// [SECTION] LAYOUT / VIEW STACK (PushView/PopView)
+//-----------------------------------------------------------------------------
+// PR 1 of the scaled-widget series: implements a render-only post-pass that
+// applies a scale+translate transform to all widget geometry emitted between
+// PushView() and PopView().
+//
+// Design summary (full notes live in the PR description):
+//   - Widgets inside a view scope draw vertices in "local" coordinates,
+//     unaware that scaling is happening. Mouse / hit-test integration lands
+//     in subsequent PRs; for now, hover/clicks inside a scope are NOT yet
+//     remapped (so the visual position and the interactive position will
+//     disagree if scale != 1).
+//   - At Push we snapshot every active draw list's (vtx_count, cmd_count).
+//     At Pop we walk each draw list from the snapshot forward and apply the
+//     forward map to vertices and to ImDrawCmd::ClipRect values that were
+//     written *inside* the scope. Anything outside the snapshot is untouched.
+//   - The cmd at index (snapshot.CmdSize - 1) intentionally stays outside
+//     the transform range: its ClipRect was inherited from the parent scope
+//     and is in parent coordinates; widgets in the scope add vertices to it
+//     but never modify its ClipRect.
+//   - Transforms compose multiplicatively when scopes nest: each PopView
+//     applies only its own local-to-parent transform, so nesting unwinds
+//     one level at a time and ends in screen space.
+//   - LIMITATION (PR 1): splitter scopes (ImDrawListSplitter) must not
+//     straddle a PushView/PopView boundary. Splitters swap the draw list's
+//     vtx/cmd buffers for channel-local ones, which makes the snapshot
+//     pointers meaningless across the boundary. A diagnostic assert can be
+//     added later; not enforced here.
+
+// Collect draw lists touched by the application.
+//
+// `snapshot_only` controls how we treat draw lists that haven't been
+// frame-reset yet on this frame:
+//  - At PushView (snapshot_only=true): SKIP them. Their VtxBuffer/CmdBuffer
+//    still holds last frame's content and will be cleared by the upcoming
+//    Begin()/GetBgFgDrawList() call. Snapshotting their stale size would
+//    cause PopView to mis-classify the range. Instead, we leave them out
+//    of the snapshot; PopView falls back to base=0, which is correct since
+//    everything they emit during the scope is in-scope content.
+//  - At PopView (snapshot_only=false): include EVERYTHING that has a draw
+//    list, regardless of frame-reset state. By pop time, anything we want
+//    to transform has already been reset and populated.
+//
+// The relevant per-list frame-reset markers:
+//  - For window draw lists: `window->Active` is set true inside Begin() right
+//    after `DrawList->_ResetForNewFrame()`.
+//  - For per-viewport bg/fg lists: `BgFgDrawListsLastTimeActive[i] == g.Time`
+//    is set by GetViewportBgFgDrawList() right after the same reset.
+static void ImGui_CollectActiveDrawLists(ImGuiContext& g, ImVector<ImDrawList*>& out, bool snapshot_only)
+{
+    for (ImGuiWindow* window : g.Windows)
+    {
+        if (window->DrawList == NULL)
+            continue;
+        if (snapshot_only && !window->Active)
+            continue; // Begin() not yet called this frame — DrawList still has last frame's content
+        out.push_back(window->DrawList);
+    }
+
+    for (ImGuiViewportP* vp : g.Viewports)
+    {
+        for (int i = 0; i < 2; i++)
+        {
+            ImDrawList* dl = vp->BgFgDrawLists[i];
+            if (dl == NULL)
+                continue;
+            if (snapshot_only && vp->BgFgDrawListsLastTimeActive[i] != (float)g.Time)
+                continue;
+            out.push_back(dl);
+        }
+    }
+}
+
+void ImGui::PushView(float scale, const ImVec2& pivot)
+{
+    ImGuiContext& g = *GImGui;
+
+    // Compose with parent view (if any). The user provides scale and pivot
+    // in CURRENT coordinates (i.e. the parent scope's local space, or screen
+    // space if no parent view is active).
+    //
+    //   parent_local = pivot + scale * (local - pivot)
+    //                = local * scale + pivot * (1 - scale)
+    //
+    // So this frame's local->parent transform is (scale, pivot*(1-scale)).
+    ImGuiViewStackFrame frame;
+    frame.LocalToParentScale  = scale;
+    frame.LocalToParentOffset = ImVec2(pivot.x * (1.0f - scale), pivot.y * (1.0f - scale));
+
+    if (g.ViewStack.Size > 0)
+    {
+        const ImGuiViewStackFrame& parent = g.ViewStack.back();
+        // screen = parent_local * parent.ComposedScale + parent.ComposedOffset
+        // parent_local = local * scale + LTP_offset
+        // screen = local * (scale * parent.ComposedScale) + (LTP_offset * parent.ComposedScale + parent.ComposedOffset)
+        frame.ComposedScale  = parent.ComposedScale * scale;
+        frame.ComposedOffset = ImVec2(
+            frame.LocalToParentOffset.x * parent.ComposedScale + parent.ComposedOffset.x,
+            frame.LocalToParentOffset.y * parent.ComposedScale + parent.ComposedOffset.y);
+    }
+    else
+    {
+        frame.ComposedScale  = scale;
+        frame.ComposedOffset = frame.LocalToParentOffset;
+    }
+
+    // Snapshot every active draw list into the flat g.ViewStackSnapshots
+    // arena. PopView() reads the slice [SnapshotsBegin .. arena_end) and
+    // truncates back to SnapshotsBegin. Storing snapshots inline on the
+    // frame would be cleaner but is incompatible with ImVector's memcpy-
+    // based element copy (the inner ImVector's Data pointer would be
+    // shallow-shared between the local 'frame' and the storage slot).
+    frame.SnapshotsBegin = g.ViewStackSnapshots.Size;
+
+    ImVector<ImDrawList*> draw_lists;
+    ImGui_CollectActiveDrawLists(g, draw_lists, /*snapshot_only=*/true);
+    for (ImDrawList* dl : draw_lists)
+    {
+        ImGuiViewDrawListSnapshot snap;
+        snap.DrawList = dl;
+        snap.VtxSize  = dl->VtxBuffer.Size;
+        snap.CmdSize  = dl->CmdBuffer.Size;
+        g.ViewStackSnapshots.push_back(snap);
+    }
+
+    g.ViewStack.push_back(frame);
+}
+
+void ImGui::PopView()
+{
+    ImGuiContext& g = *GImGui;
+    IM_ASSERT(g.ViewStack.Size > 0 && "PopView() called with no matching PushView()");
+
+    const ImGuiViewStackFrame frame = g.ViewStack.back();
+    const float  s  = frame.LocalToParentScale;
+    const ImVec2 o  = frame.LocalToParentOffset;
+
+    // Snapshot range in the flat arena: [snap_begin .. snap_end).
+    const int snap_begin = frame.SnapshotsBegin;
+    const int snap_end   = g.ViewStackSnapshots.Size;
+
+    // Walk every currently-active draw list. Lists with no snapshot in our
+    // range (i.e. created during the scope) get an implicit base of {0,0}
+    // and have their entire current buffer transformed.
+    ImVector<ImDrawList*> draw_lists;
+    ImGui_CollectActiveDrawLists(g, draw_lists, /*snapshot_only=*/false);
+    for (ImDrawList* dl : draw_lists)
+    {
+        int base_vtx = 0;
+        int base_cmd = 0;
+        for (int i = snap_begin; i < snap_end; i++)
+        {
+            const ImGuiViewDrawListSnapshot& snap = g.ViewStackSnapshots[i];
+            if (snap.DrawList == dl) { base_vtx = snap.VtxSize; base_cmd = snap.CmdSize; break; }
+        }
+
+        // Forward-map vertices added during the scope.
+        ImDrawVert* verts = dl->VtxBuffer.Data;
+        for (int i = base_vtx; i < dl->VtxBuffer.Size; i++)
+        {
+            verts[i].pos.x = verts[i].pos.x * s + o.x;
+            verts[i].pos.y = verts[i].pos.y * s + o.y;
+        }
+
+        // Forward-map clip rects on cmds added during the scope. Positive
+        // scale keeps rects axis-aligned; mins stay mins, maxs stay maxs.
+        // (Rotation / negative scale would need a different representation
+        // and are out of scope for PR 1.)
+        ImDrawCmd* cmds = dl->CmdBuffer.Data;
+        for (int i = base_cmd; i < dl->CmdBuffer.Size; i++)
+        {
+            ImVec4& c = cmds[i].ClipRect;
+            c.x = c.x * s + o.x;
+            c.y = c.y * s + o.y;
+            c.z = c.z * s + o.x;
+            c.w = c.w * s + o.y;
+        }
+    }
+
+    g.ViewStackSnapshots.resize(snap_begin);
+    g.ViewStack.pop_back();
+}
+
+float ImGui::GetViewScale()
+{
+    ImGuiContext& g = *GImGui;
+    return g.ViewStack.Size > 0 ? g.ViewStack.back().ComposedScale : 1.0f;
+}
+
+ImVec2 ImGui::GetViewOffset()
+{
+    ImGuiContext& g = *GImGui;
+    return g.ViewStack.Size > 0 ? g.ViewStack.back().ComposedOffset : ImVec2(0.0f, 0.0f);
+}
+
 static void ImGui::RenderDimmedBackgroundBehindWindow(ImGuiWindow* window, ImU32 col)
 {
     if ((col & IM_COL32_A_MASK) == 0)
@@ -11015,6 +11211,7 @@ void ImGui::ErrorRecoveryStoreState(ImGuiErrorRecoveryState* state_out)
     state_out->SizeOfItemFlagsStack = (short)g.ItemFlagsStack.Size;
     state_out->SizeOfBeginPopupStack = (short)g.BeginPopupStack.Size;
     state_out->SizeOfDisabledStack = (short)g.DisabledStackSize;
+    state_out->SizeOfViewStack = (short)g.ViewStack.Size;
 }
 
 // Chosen name "Try to recover" over e.g. "Restore" to suggest this is not a 100% guaranteed recovery.
@@ -11114,6 +11311,12 @@ void    ImGui::ErrorRecoveryTryToRecoverWindowState(const ImGuiErrorRecoveryStat
         }
     }
     IM_ASSERT(g.DisabledStackSize == state_in->SizeOfDisabledStack);
+    while (g.ViewStack.Size > state_in->SizeOfViewStack) //-V1044
+    {
+        IM_ASSERT_USER_ERROR(0, "Missing PopView()");
+        PopView();
+    }
+    IM_ASSERT(g.ViewStack.Size == state_in->SizeOfViewStack);
     while (g.ColorStack.Size > state_in->SizeOfColorStack) //-V1044
     {
         IM_ASSERT_USER_ERROR(0, "Missing PopStyleColor()");
