@@ -143,6 +143,13 @@ static int RunInteractive()
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
+    // Live-editable view transform applied to the widget zoo. The control
+    // panel itself is drawn OUTSIDE the PushView scope so the user can
+    // always reach it regardless of how extreme the scale gets.
+    float  view_scale  = 1.0f;
+    ImVec2 view_pivot  = ImVec2(400.0f, 300.0f);
+    bool   view_enable = true;
+
     while (!glfwWindowShouldClose(window))
     {
         glfwPollEvents();
@@ -151,7 +158,24 @@ static int RunInteractive()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // Control panel (always at identity).
+        ImGui::SetNextWindowPos(ImVec2(800, 20), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(360, 200), ImGuiCond_FirstUseEver);
+        ImGui::Begin("View Controls");
+        ImGui::Checkbox("Apply view transform", &view_enable);
+        ImGui::SliderFloat("scale",  &view_scale,    0.25f, 4.0f, "%.3f");
+        ImGui::SliderFloat("pivot.x",&view_pivot.x,  0.0f, 1280.0f, "%.0f");
+        ImGui::SliderFloat("pivot.y",&view_pivot.y,  0.0f,  800.0f, "%.0f");
+        ImGui::TextDisabled("composed: scale=%.3f offset=(%.1f, %.1f)",
+                            ImGui::GetViewScale(), ImGui::GetViewOffset().x, ImGui::GetViewOffset().y);
+        ImGui::TextDisabled("(PR 1: visual only — hit-test stays unscaled)");
+        ImGui::End();
+
+        if (view_enable && view_scale != 1.0f)
+            ImGui::PushView(view_scale, view_pivot);
         ScaleHarness::RenderWidgetZoo();
+        if (view_enable && view_scale != 1.0f)
+            ImGui::PopView();
 
         ImGui::Render();
         int fb_w, fb_h;
@@ -176,7 +200,8 @@ static int RunInteractive()
 // Headless mode
 // ---------------------------------------------------------------------------
 
-static int RunHeadless(const char* out_path, int width, int height, int frames)
+static int RunHeadless(const char* out_path, int width, int height, int frames,
+                       float view_scale, ImVec2 view_pivot, bool view_pivot_set)
 {
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) return 1;
@@ -234,7 +259,17 @@ static int RunHeadless(const char* out_path, int width, int height, int frames)
         io.DeltaTime = 1.0f / 60.0f;
         ImGui::NewFrame();
 
+        // Apply view transform if scale differs from identity. Default pivot
+        // is the framebuffer center so e.g. `--scale 2` zooms toward the
+        // middle without dragging the zoo offscreen.
+        const ImVec2 pivot = view_pivot_set ? view_pivot
+                                            : ImVec2((float)fb_w * 0.5f, (float)fb_h * 0.5f);
+        const bool view_active = (view_scale != 1.0f);
+        if (view_active)
+            ImGui::PushView(view_scale, pivot);
         ScaleHarness::RenderWidgetZoo();
+        if (view_active)
+            ImGui::PopView();
 
         ImGui::Render();
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -285,6 +320,9 @@ int main(int argc, char** argv)
     int width = 800;
     int height = 600;
     int frames = 2;
+    float view_scale = 1.0f;
+    ImVec2 view_pivot(0, 0);
+    bool view_pivot_set = false;
 
     for (int i = 1; i < argc; i++)
     {
@@ -299,9 +337,24 @@ int main(int argc, char** argv)
             height = std::atoi(argv[++i]);
         } else if (std::strcmp(a, "--frames") == 0 && i + 1 < argc) {
             frames = std::atoi(argv[++i]);
+        } else if (std::strcmp(a, "--scale") == 0 && i + 1 < argc) {
+            view_scale = (float)std::atof(argv[++i]);
+        } else if (std::strcmp(a, "--pivot") == 0 && i + 1 < argc) {
+            // Accept "x,y".
+            const char* s = argv[++i];
+            float px = 0, py = 0;
+            if (std::sscanf(s, "%f,%f", &px, &py) != 2) {
+                std::fprintf(stderr, "scale_harness: --pivot expects 'x,y' (got '%s')\n", s);
+                return 2;
+            }
+            view_pivot = ImVec2(px, py);
+            view_pivot_set = true;
         } else if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
             std::printf(
-                "Usage: %s [--headless [-o out.png] [-W width] [-H height] [--frames N]]\n",
+                "Usage: %s [--headless [-o out.png] [-W w] [-H h] [--frames N]\n"
+                "                      [--scale s] [--pivot x,y]]\n"
+                "  --scale and --pivot apply a PushView/PopView around the widget zoo.\n"
+                "  Default pivot is the framebuffer center.\n",
                 argv[0]);
             return 0;
         } else {
@@ -310,5 +363,6 @@ int main(int argc, char** argv)
         }
     }
 
-    return headless ? RunHeadless(out_path, width, height, frames) : RunInteractive();
+    return headless ? RunHeadless(out_path, width, height, frames, view_scale, view_pivot, view_pivot_set)
+                    : RunInteractive();
 }

@@ -993,6 +993,16 @@ namespace ImGui
     IMGUI_API void          PushClipRect(const ImVec2& clip_rect_min, const ImVec2& clip_rect_max, bool intersect_with_current_clip_rect);
     IMGUI_API void          PopClipRect();
 
+    // View transform (experimental — scaled widgets for node-editor-style UIs)
+    // - PushView() applies a uniform scale around `pivot` (in current/screen coordinates) to all widget geometry emitted between Push and Pop.
+    // - Calls compose multiplicatively. GetViewScale/GetViewOffset report the composed transform from current-local to screen.
+    // - Implemented in PR 1 of the scaled-widget series as a render-only post-pass on ImDrawList vertices and clip rects.
+    //   Mouse/popup/child-window integration lands in subsequent PRs; in this PR widgets inside a scope are visual only — clicks/hover are not yet remapped.
+    IMGUI_API void          PushView(float scale, const ImVec2& pivot);
+    IMGUI_API void          PopView();
+    IMGUI_API float         GetViewScale();                                                     // composed scale: local-space units per screen-space unit's reciprocal (i.e. screen = local * scale + offset).
+    IMGUI_API ImVec2        GetViewOffset();                                                    // composed offset (see GetViewScale).
+
     // Focus, Activation
     IMGUI_API void          SetItemDefaultFocus();                                              // make last item the default focused item of a newly appearing window.
     IMGUI_API void          SetKeyboardFocusHere(int offset = 0);                               // focus keyboard on the next widget. Use positive 'offset' to access sub components of a multiple component widget. Use -1 to access previous widget.

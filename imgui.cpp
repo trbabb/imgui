@@ -5916,6 +5916,167 @@ void ImGui::PopClipRect()
     window->ClipRect = window->DrawList->_ClipRectStack.back();
 }
 
+//-----------------------------------------------------------------------------
+// [SECTION] LAYOUT / VIEW STACK (PushView/PopView)
+//-----------------------------------------------------------------------------
+// PR 1 of the scaled-widget series: implements a render-only post-pass that
+// applies a scale+translate transform to all widget geometry emitted between
+// PushView() and PopView().
+//
+// Design summary (full notes live in the PR description):
+//   - Widgets inside a view scope draw vertices in "local" coordinates,
+//     unaware that scaling is happening. Mouse / hit-test integration lands
+//     in subsequent PRs; for now, hover/clicks inside a scope are NOT yet
+//     remapped (so the visual position and the interactive position will
+//     disagree if scale != 1).
+//   - At Push we snapshot every active draw list's (vtx_count, cmd_count).
+//     At Pop we walk each draw list from the snapshot forward and apply the
+//     forward map to vertices and to ImDrawCmd::ClipRect values that were
+//     written *inside* the scope. Anything outside the snapshot is untouched.
+//   - The cmd at index (snapshot.CmdSize - 1) intentionally stays outside
+//     the transform range: its ClipRect was inherited from the parent scope
+//     and is in parent coordinates; widgets in the scope add vertices to it
+//     but never modify its ClipRect.
+//   - Transforms compose multiplicatively when scopes nest: each PopView
+//     applies only its own local-to-parent transform, so nesting unwinds
+//     one level at a time and ends in screen space.
+//   - LIMITATION (PR 1): splitter scopes (ImDrawListSplitter) must not
+//     straddle a PushView/PopView boundary. Splitters swap the draw list's
+//     vtx/cmd buffers for channel-local ones, which makes the snapshot
+//     pointers meaningless across the boundary. A diagnostic assert can be
+//     added later; not enforced here.
+
+static void ImGui_CollectActiveDrawLists(ImGuiContext& g, ImVector<ImDrawList*>& out)
+{
+    // Window draw lists. We include every window in g.Windows because a
+    // window first-touched inside a view scope (e.g. a child window opened
+    // mid-scope) still needs its vertices transformed even though it didn't
+    // exist at push time — its snapshot of {0, 0} will be implicit.
+    for (ImGuiWindow* window : g.Windows)
+        if (window->DrawList != NULL)
+            out.push_back(window->DrawList);
+
+    // Per-viewport background/foreground convenience draw lists. These are
+    // lazily allocated by GetBackgroundDrawList()/GetForegroundDrawList() so
+    // they may be null.
+    for (ImGuiViewportP* vp : g.Viewports)
+    {
+        if (vp->BgFgDrawLists[0] != NULL) out.push_back(vp->BgFgDrawLists[0]);
+        if (vp->BgFgDrawLists[1] != NULL) out.push_back(vp->BgFgDrawLists[1]);
+    }
+}
+
+void ImGui::PushView(float scale, const ImVec2& pivot)
+{
+    ImGuiContext& g = *GImGui;
+
+    // Compose with parent view (if any). The user provides scale and pivot
+    // in CURRENT coordinates (i.e. the parent scope's local space, or screen
+    // space if no parent view is active).
+    //
+    //   parent_local = pivot + scale * (local - pivot)
+    //                = local * scale + pivot * (1 - scale)
+    //
+    // So this frame's local->parent transform is (scale, pivot*(1-scale)).
+    ImGuiViewStackFrame frame;
+    frame.LocalToParentScale  = scale;
+    frame.LocalToParentOffset = ImVec2(pivot.x * (1.0f - scale), pivot.y * (1.0f - scale));
+
+    if (g.ViewStack.Size > 0)
+    {
+        const ImGuiViewStackFrame& parent = g.ViewStack.back();
+        // screen = parent_local * parent.ComposedScale + parent.ComposedOffset
+        // parent_local = local * scale + LTP_offset
+        // screen = local * (scale * parent.ComposedScale) + (LTP_offset * parent.ComposedScale + parent.ComposedOffset)
+        frame.ComposedScale  = parent.ComposedScale * scale;
+        frame.ComposedOffset = ImVec2(
+            frame.LocalToParentOffset.x * parent.ComposedScale + parent.ComposedOffset.x,
+            frame.LocalToParentOffset.y * parent.ComposedScale + parent.ComposedOffset.y);
+    }
+    else
+    {
+        frame.ComposedScale  = scale;
+        frame.ComposedOffset = frame.LocalToParentOffset;
+    }
+
+    // Snapshot every active draw list. PopView() walks the same set; any
+    // draw list created *after* the push appears with no recorded snapshot
+    // and is treated as having {0,0} — its entire buffer is transformed.
+    ImVector<ImDrawList*> draw_lists;
+    ImGui_CollectActiveDrawLists(g, draw_lists);
+    frame.DrawListSnapshots.reserve(draw_lists.Size);
+    for (ImDrawList* dl : draw_lists)
+    {
+        ImGuiViewDrawListSnapshot snap;
+        snap.DrawList = dl;
+        snap.VtxSize  = dl->VtxBuffer.Size;
+        snap.CmdSize  = dl->CmdBuffer.Size;
+        frame.DrawListSnapshots.push_back(snap);
+    }
+
+    g.ViewStack.push_back(frame);
+}
+
+void ImGui::PopView()
+{
+    ImGuiContext& g = *GImGui;
+    IM_ASSERT(g.ViewStack.Size > 0 && "PopView() called with no matching PushView()");
+
+    const ImGuiViewStackFrame frame = g.ViewStack.back();
+    const float  s  = frame.LocalToParentScale;
+    const ImVec2 o  = frame.LocalToParentOffset;
+
+    // Build a map from snapshotted draw list to its baseline sizes for O(N)
+    // pass over the current draw list set. The number of draw lists is
+    // typically tiny (a handful of windows plus 0-2 bg/fg lists), so a
+    // linear scan is fine.
+    ImVector<ImDrawList*> draw_lists;
+    ImGui_CollectActiveDrawLists(g, draw_lists);
+    for (ImDrawList* dl : draw_lists)
+    {
+        int base_vtx = 0;
+        int base_cmd = 0;
+        for (const ImGuiViewDrawListSnapshot& snap : frame.DrawListSnapshots)
+            if (snap.DrawList == dl) { base_vtx = snap.VtxSize; base_cmd = snap.CmdSize; break; }
+
+        // Forward-map vertices added during the scope.
+        ImDrawVert* verts = dl->VtxBuffer.Data;
+        for (int i = base_vtx; i < dl->VtxBuffer.Size; i++)
+        {
+            verts[i].pos.x = verts[i].pos.x * s + o.x;
+            verts[i].pos.y = verts[i].pos.y * s + o.y;
+        }
+
+        // Forward-map clip rects on cmds added during the scope. Positive
+        // scale keeps rects axis-aligned; mins stay mins, maxs stay maxs.
+        // (Rotation / negative scale would need a different representation
+        // and are out of scope for PR 1.)
+        ImDrawCmd* cmds = dl->CmdBuffer.Data;
+        for (int i = base_cmd; i < dl->CmdBuffer.Size; i++)
+        {
+            ImVec4& c = cmds[i].ClipRect;
+            c.x = c.x * s + o.x;
+            c.y = c.y * s + o.y;
+            c.z = c.z * s + o.x;
+            c.w = c.w * s + o.y;
+        }
+    }
+
+    g.ViewStack.pop_back();
+}
+
+float ImGui::GetViewScale()
+{
+    ImGuiContext& g = *GImGui;
+    return g.ViewStack.Size > 0 ? g.ViewStack.back().ComposedScale : 1.0f;
+}
+
+ImVec2 ImGui::GetViewOffset()
+{
+    ImGuiContext& g = *GImGui;
+    return g.ViewStack.Size > 0 ? g.ViewStack.back().ComposedOffset : ImVec2(0.0f, 0.0f);
+}
+
 static void ImGui::RenderDimmedBackgroundBehindWindow(ImGuiWindow* window, ImU32 col)
 {
     if ((col & IM_COL32_A_MASK) == 0)
@@ -11015,6 +11176,7 @@ void ImGui::ErrorRecoveryStoreState(ImGuiErrorRecoveryState* state_out)
     state_out->SizeOfItemFlagsStack = (short)g.ItemFlagsStack.Size;
     state_out->SizeOfBeginPopupStack = (short)g.BeginPopupStack.Size;
     state_out->SizeOfDisabledStack = (short)g.DisabledStackSize;
+    state_out->SizeOfViewStack = (short)g.ViewStack.Size;
 }
 
 // Chosen name "Try to recover" over e.g. "Restore" to suggest this is not a 100% guaranteed recovery.
@@ -11114,6 +11276,12 @@ void    ImGui::ErrorRecoveryTryToRecoverWindowState(const ImGuiErrorRecoveryStat
         }
     }
     IM_ASSERT(g.DisabledStackSize == state_in->SizeOfDisabledStack);
+    while (g.ViewStack.Size > state_in->SizeOfViewStack) //-V1044
+    {
+        IM_ASSERT_USER_ERROR(0, "Missing PopView()");
+        PopView();
+    }
+    IM_ASSERT(g.ViewStack.Size == state_in->SizeOfViewStack);
     while (g.ColorStack.Size > state_in->SizeOfColorStack) //-V1044
     {
         IM_ASSERT_USER_ERROR(0, "Missing PopStyleColor()");

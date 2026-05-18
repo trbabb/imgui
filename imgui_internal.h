@@ -184,6 +184,8 @@ struct ImGuiTableColumnsSettings;   // Storage for a column .ini settings
 struct ImGuiTreeNodeStackData;      // Temporary storage for TreeNode().
 struct ImGuiTypingSelectState;      // Storage for GetTypingSelectRequest()
 struct ImGuiTypingSelectRequest;    // Storage for GetTypingSelectRequest() (aimed to be public)
+struct ImGuiViewStackFrame;         // One PushView()/PopView() scope: scale+translate transform + per-draw-list snapshots
+struct ImGuiViewDrawListSnapshot;   // Snapshot of an ImDrawList's vtx/cmd buffer sizes at PushView() time
 struct ImGuiWindow;                 // Storage for one window
 struct ImGuiWindowTempData;         // Temporary storage for one window (that's the data which in theory we could ditch at the end of the frame, in practice we currently keep it for each window)
 struct ImGuiWindowSettings;         // Storage for a window .ini settings (we keep one of those even if the actual window wasn't instanced during this session)
@@ -1412,7 +1414,7 @@ struct ImGuiTreeNodeStackData
     ImGuiTableColumnIdx     DrawLinesTableColumn;
 };
 
-// sizeof() = 20
+// sizeof() = 22
 struct IMGUI_API ImGuiErrorRecoveryState
 {
     short   SizeOfWindowStack;
@@ -1426,8 +1428,45 @@ struct IMGUI_API ImGuiErrorRecoveryState
     short   SizeOfItemFlagsStack;
     short   SizeOfBeginPopupStack;
     short   SizeOfDisabledStack;
+    short   SizeOfViewStack;
 
     ImGuiErrorRecoveryState() { memset((void*)this, 0, sizeof(*this)); }
+};
+
+// One per-draw-list snapshot of where each ImDrawList stood when a PushView
+// scope began. At PopView we use these to find the slice of vertices and
+// commands that were emitted *inside* the scope and forward-map them.
+//
+// Stored as a flat array on the view stack frame, keyed by ImDrawList* —
+// linear scan at pop is fine since the number of active draw lists is
+// small. Draw lists that didn't exist at push time (newly-activated windows,
+// background/foreground lists first touched within the scope) get an
+// implicit snapshot of {0, 0} and have their entire current buffer treated
+// as in-scope.
+struct ImGuiViewDrawListSnapshot
+{
+    ImDrawList*     DrawList;
+    int             VtxSize;
+    int             CmdSize;
+};
+
+// View stack frame — describes a single PushView/PopView scope.
+//
+// Transforms compose multiplicatively up the stack:
+//   parent_local_pos = local_pos * LocalToParentScale + LocalToParentOffset
+//   screen_pos       = local_pos * ComposedScale       + ComposedOffset
+//
+// LocalToParent is the post-pass transform applied at this frame's PopView:
+// it maps vertex coordinates back into the parent frame's space (or screen
+// space if this is the outermost view). Composed values are cached for
+// O(1) access from GetViewScale()/GetViewOffset().
+struct ImGuiViewStackFrame
+{
+    float           LocalToParentScale;
+    ImVec2          LocalToParentOffset;
+    float           ComposedScale;
+    ImVec2          ComposedOffset;
+    ImVector<ImGuiViewDrawListSnapshot> DrawListSnapshots;
 };
 
 // Data saved for each window pushed into the stack
@@ -2324,6 +2363,7 @@ struct ImGuiContext
     ImVector<ImGuiPopupData>        OpenPopupStack;             // Which popups are open (persistent)
     ImVector<ImGuiPopupData>        BeginPopupStack;            // Which level of BeginPopup() we are in (reset every frame)
     ImVector<ImGuiTreeNodeStackData>TreeNodeStack;              // Stack for TreeNode()
+    ImVector<ImGuiViewStackFrame>   ViewStack;                  // Stack for PushView()/PopView() — applies scale+translate to widget geometry
 
     // Viewports
     ImVector<ImGuiViewportP*> Viewports;                        // Active viewports (Size==1 in 'master' branch). Each viewports hold their copy of ImDrawData.
