@@ -192,23 +192,28 @@ static int RunInteractive()
             ImGui::PushView(view_scale, pivot);
         ScaleHarness::RenderWidgetZoo();
 
-        // Nested panel — works whether or not the outer view is active.
-        // We express the screen pivot in the CURRENT local frame (which is
-        // outer-local if outer is pushed, else screen) by inverting the
-        // composed transform:  local = (screen - offset) / scale.
-        // That keeps the nested panel centered on the screen pivot at any
-        // composed scale.
+        // Nested panel — fixed location at the right edge under the zoo,
+        // pivoting around its OWN center. The pivot is independent of the
+        // outer view's cursor pivot so the panel doesn't track the mouse
+        // and only its size animates as the nest scale changes.
+        //
+        // To rotate around its center, the pivot must be the panel's
+        // center expressed in the CURRENT local frame (which is outer-
+        // local if outer is pushed, else screen). We invert the composed
+        // outer transform with GetViewScale/GetViewOffset.
         if (nest_enable && nest_scale != 1.0f)
         {
+            const ImVec2 panel_size(220.0f, 80.0f);
+            const ImVec2 panel_screen_center(540.0f, 660.0f);
+
             const float  cs = ImGui::GetViewScale();
             const ImVec2 co = ImGui::GetViewOffset();
-            const ImVec2 inner_pivot_in_local((pivot.x - co.x) / cs,
-                                              (pivot.y - co.y) / cs);
-            ImGui::PushView(nest_scale, inner_pivot_in_local);
+            const ImVec2 panel_center_local((panel_screen_center.x - co.x) / cs,
+                                            (panel_screen_center.y - co.y) / cs);
+            ImGui::PushView(nest_scale, panel_center_local);
 
-            const ImVec2 panel_size(220.0f, 80.0f);
-            const ImVec2 panel_pos(inner_pivot_in_local.x - panel_size.x * 0.5f,
-                                   inner_pivot_in_local.y - panel_size.y * 0.5f);
+            const ImVec2 panel_pos(panel_center_local.x - panel_size.x * 0.5f,
+                                   panel_center_local.y - panel_size.y * 0.5f);
             ImGui::SetNextWindowPos(panel_pos, ImGuiCond_Always);
             ImGui::SetNextWindowSize(panel_size, ImGuiCond_Always);
             ImGui::Begin("Nested", nullptr, ImGuiWindowFlags_NoSavedSettings);
