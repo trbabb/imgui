@@ -192,23 +192,23 @@ static int RunInteractive()
             ImGui::PushView(view_scale, pivot);
         ScaleHarness::RenderWidgetZoo();
 
-        // Nested panel — mirrors the headless --nest-scale verification.
-        // Both views share the same screen pivot, so the panel stays
-        // centered there at any composed scale. The displayed
-        // composed=GetViewScale() should equal outer*inner exactly.
-        if (nest_enable && outer_active && nest_scale != 1.0f)
+        // Nested panel — works whether or not the outer view is active.
+        // We express the screen pivot in the CURRENT local frame (which is
+        // outer-local if outer is pushed, else screen) by inverting the
+        // composed transform:  local = (screen - offset) / scale.
+        // That keeps the nested panel centered on the screen pivot at any
+        // composed scale.
+        if (nest_enable && nest_scale != 1.0f)
         {
-            // Express the screen pivot in outer-local coordinates.
-            const float outer_offset_x = pivot.x * (1.0f - view_scale);
-            const float outer_offset_y = pivot.y * (1.0f - view_scale);
-            const ImVec2 inner_pivot_in_outer_local(
-                (pivot.x - outer_offset_x) / view_scale,
-                (pivot.y - outer_offset_y) / view_scale);
-            ImGui::PushView(nest_scale, inner_pivot_in_outer_local);
+            const float  cs = ImGui::GetViewScale();
+            const ImVec2 co = ImGui::GetViewOffset();
+            const ImVec2 inner_pivot_in_local((pivot.x - co.x) / cs,
+                                              (pivot.y - co.y) / cs);
+            ImGui::PushView(nest_scale, inner_pivot_in_local);
 
             const ImVec2 panel_size(220.0f, 80.0f);
-            const ImVec2 panel_pos(inner_pivot_in_outer_local.x - panel_size.x * 0.5f,
-                                   inner_pivot_in_outer_local.y - panel_size.y * 0.5f);
+            const ImVec2 panel_pos(inner_pivot_in_local.x - panel_size.x * 0.5f,
+                                   inner_pivot_in_local.y - panel_size.y * 0.5f);
             ImGui::SetNextWindowPos(panel_pos, ImGuiCond_Always);
             ImGui::SetNextWindowSize(panel_size, ImGuiCond_Always);
             ImGui::Begin("Nested", nullptr, ImGuiWindowFlags_NoSavedSettings);
