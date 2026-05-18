@@ -201,7 +201,8 @@ static int RunInteractive()
 // ---------------------------------------------------------------------------
 
 static int RunHeadless(const char* out_path, int width, int height, int frames,
-                       float view_scale, ImVec2 view_pivot, bool view_pivot_set)
+                       float view_scale, ImVec2 view_pivot, bool view_pivot_set,
+                       float nest_scale)
 {
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit()) return 1;
@@ -280,6 +281,43 @@ static int RunHeadless(const char* out_path, int width, int height, int frames,
         if (view_active)
             ImGui::PushView(view_scale, pivot);
         ScaleHarness::RenderWidgetZoo();
+
+        // Nested-scope verification. We push a second view inside the first.
+        //
+        // Both inner and outer pivots are the same screen point (`pivot`),
+        // and the panel is positioned so its center sits on that pivot. As
+        // a result the panel is invariant in screen position under any
+        // composed scale — only its size changes. That makes "did the
+        // nesting math work" purely a question of the panel's rendered
+        // size, which is easy to eyeball.
+        //
+        // Note: the inner PushView interprets its pivot in the OUTER's
+        // local coordinate system. We compute outer-local = (screen - outer_offset) / outer_scale
+        // to express the same screen point in outer-local space.
+        if (nest_scale != 1.0f && view_active)
+        {
+            const float  outer_offset_x = pivot.x * (1.0f - view_scale);
+            const float  outer_offset_y = pivot.y * (1.0f - view_scale);
+            const ImVec2 inner_pivot_in_outer_local(
+                (pivot.x - outer_offset_x) / view_scale,
+                (pivot.y - outer_offset_y) / view_scale);
+            ImGui::PushView(nest_scale, inner_pivot_in_outer_local);
+
+            // Position the panel so its center is the inner pivot
+            // (which composes to `pivot` in screen space).
+            const ImVec2 panel_size(220.0f, 80.0f);
+            const ImVec2 panel_pos(inner_pivot_in_outer_local.x - panel_size.x * 0.5f,
+                                   inner_pivot_in_outer_local.y - panel_size.y * 0.5f);
+            ImGui::SetNextWindowPos(panel_pos, ImGuiCond_Always);
+            ImGui::SetNextWindowSize(panel_size, ImGuiCond_Always);
+            ImGui::Begin("Nested", nullptr, ImGuiWindowFlags_NoSavedSettings);
+            ImGui::Text("outer=%.2f inner=%.2f", view_scale, nest_scale);
+            ImGui::Text("composed=%.3f expected=%.3f",
+                        ImGui::GetViewScale(), view_scale * nest_scale);
+            ImGui::End();
+            ImGui::PopView();
+        }
+
         if (view_active)
             ImGui::PopView();
 
@@ -335,6 +373,7 @@ int main(int argc, char** argv)
     float view_scale = 1.0f;
     ImVec2 view_pivot(0, 0);
     bool view_pivot_set = false;
+    float nest_scale = 1.0f;
 
     for (int i = 1; i < argc; i++)
     {
@@ -351,6 +390,8 @@ int main(int argc, char** argv)
             frames = std::atoi(argv[++i]);
         } else if (std::strcmp(a, "--scale") == 0 && i + 1 < argc) {
             view_scale = (float)std::atof(argv[++i]);
+        } else if (std::strcmp(a, "--nest-scale") == 0 && i + 1 < argc) {
+            nest_scale = (float)std::atof(argv[++i]);
         } else if (std::strcmp(a, "--pivot") == 0 && i + 1 < argc) {
             // Accept "x,y".
             const char* s = argv[++i];
@@ -364,9 +405,11 @@ int main(int argc, char** argv)
         } else if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
             std::printf(
                 "Usage: %s [--headless [-o out.png] [-W w] [-H h] [--frames N]\n"
-                "                      [--scale s] [--pivot x,y]]\n"
+                "                      [--scale s] [--pivot x,y] [--nest-scale s2]]\n"
                 "  --scale and --pivot apply a PushView/PopView around the widget zoo.\n"
-                "  Default pivot is the framebuffer center.\n",
+                "  Default pivot is the framebuffer center.\n"
+                "  --nest-scale s2 adds a second PushView inside the first and renders\n"
+                "  a 'Nested' panel inside it. Composed scale should be scale*nest_scale.\n",
                 argv[0]);
             return 0;
         } else {
@@ -375,6 +418,6 @@ int main(int argc, char** argv)
         }
     }
 
-    return headless ? RunHeadless(out_path, width, height, frames, view_scale, view_pivot, view_pivot_set)
+    return headless ? RunHeadless(out_path, width, height, frames, view_scale, view_pivot, view_pivot_set, nest_scale)
                     : RunInteractive();
 }
