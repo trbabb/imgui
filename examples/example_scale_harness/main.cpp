@@ -265,6 +265,18 @@ static int RunHeadless(const char* out_path, int width, int height, int frames,
         const ImVec2 pivot = view_pivot_set ? view_pivot
                                             : ImVec2((float)fb_w * 0.5f, (float)fb_h * 0.5f);
         const bool view_active = (view_scale != 1.0f);
+
+        // Sanity panel rendered OUTSIDE the view scope: must stay at its
+        // fixed position regardless of --scale. Caught a real bug in PR 1
+        // (nested-ImVector double-free in the snapshot arena) and is kept
+        // as a permanent visual regression check.
+        ImGui::SetNextWindowPos(ImVec2(500, 20), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(280, 80), ImGuiCond_Always);
+        ImGui::Begin("Outside View", nullptr, ImGuiWindowFlags_NoSavedSettings);
+        ImGui::Text("Drawn outside PushView.");
+        ImGui::Text("scale=%.2f", view_scale);
+        ImGui::End();
+
         if (view_active)
             ImGui::PushView(view_scale, pivot);
         ScaleHarness::RenderWidgetZoo();

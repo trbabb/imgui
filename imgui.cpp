@@ -5946,23 +5946,47 @@ void ImGui::PopClipRect()
 //     pointers meaningless across the boundary. A diagnostic assert can be
 //     added later; not enforced here.
 
-static void ImGui_CollectActiveDrawLists(ImGuiContext& g, ImVector<ImDrawList*>& out)
+// Collect draw lists touched by the application.
+//
+// `snapshot_only` controls how we treat draw lists that haven't been
+// frame-reset yet on this frame:
+//  - At PushView (snapshot_only=true): SKIP them. Their VtxBuffer/CmdBuffer
+//    still holds last frame's content and will be cleared by the upcoming
+//    Begin()/GetBgFgDrawList() call. Snapshotting their stale size would
+//    cause PopView to mis-classify the range. Instead, we leave them out
+//    of the snapshot; PopView falls back to base=0, which is correct since
+//    everything they emit during the scope is in-scope content.
+//  - At PopView (snapshot_only=false): include EVERYTHING that has a draw
+//    list, regardless of frame-reset state. By pop time, anything we want
+//    to transform has already been reset and populated.
+//
+// The relevant per-list frame-reset markers:
+//  - For window draw lists: `window->Active` is set true inside Begin() right
+//    after `DrawList->_ResetForNewFrame()`.
+//  - For per-viewport bg/fg lists: `BgFgDrawListsLastTimeActive[i] == g.Time`
+//    is set by GetViewportBgFgDrawList() right after the same reset.
+static void ImGui_CollectActiveDrawLists(ImGuiContext& g, ImVector<ImDrawList*>& out, bool snapshot_only)
 {
-    // Window draw lists. We include every window in g.Windows because a
-    // window first-touched inside a view scope (e.g. a child window opened
-    // mid-scope) still needs its vertices transformed even though it didn't
-    // exist at push time — its snapshot of {0, 0} will be implicit.
     for (ImGuiWindow* window : g.Windows)
-        if (window->DrawList != NULL)
-            out.push_back(window->DrawList);
+    {
+        if (window->DrawList == NULL)
+            continue;
+        if (snapshot_only && !window->Active)
+            continue; // Begin() not yet called this frame — DrawList still has last frame's content
+        out.push_back(window->DrawList);
+    }
 
-    // Per-viewport background/foreground convenience draw lists. These are
-    // lazily allocated by GetBackgroundDrawList()/GetForegroundDrawList() so
-    // they may be null.
     for (ImGuiViewportP* vp : g.Viewports)
     {
-        if (vp->BgFgDrawLists[0] != NULL) out.push_back(vp->BgFgDrawLists[0]);
-        if (vp->BgFgDrawLists[1] != NULL) out.push_back(vp->BgFgDrawLists[1]);
+        for (int i = 0; i < 2; i++)
+        {
+            ImDrawList* dl = vp->BgFgDrawLists[i];
+            if (dl == NULL)
+                continue;
+            if (snapshot_only && vp->BgFgDrawListsLastTimeActive[i] != (float)g.Time)
+                continue;
+            out.push_back(dl);
+        }
     }
 }
 
@@ -5999,19 +6023,23 @@ void ImGui::PushView(float scale, const ImVec2& pivot)
         frame.ComposedOffset = frame.LocalToParentOffset;
     }
 
-    // Snapshot every active draw list. PopView() walks the same set; any
-    // draw list created *after* the push appears with no recorded snapshot
-    // and is treated as having {0,0} — its entire buffer is transformed.
+    // Snapshot every active draw list into the flat g.ViewStackSnapshots
+    // arena. PopView() reads the slice [SnapshotsBegin .. arena_end) and
+    // truncates back to SnapshotsBegin. Storing snapshots inline on the
+    // frame would be cleaner but is incompatible with ImVector's memcpy-
+    // based element copy (the inner ImVector's Data pointer would be
+    // shallow-shared between the local 'frame' and the storage slot).
+    frame.SnapshotsBegin = g.ViewStackSnapshots.Size;
+
     ImVector<ImDrawList*> draw_lists;
-    ImGui_CollectActiveDrawLists(g, draw_lists);
-    frame.DrawListSnapshots.reserve(draw_lists.Size);
+    ImGui_CollectActiveDrawLists(g, draw_lists, /*snapshot_only=*/true);
     for (ImDrawList* dl : draw_lists)
     {
         ImGuiViewDrawListSnapshot snap;
         snap.DrawList = dl;
         snap.VtxSize  = dl->VtxBuffer.Size;
         snap.CmdSize  = dl->CmdBuffer.Size;
-        frame.DrawListSnapshots.push_back(snap);
+        g.ViewStackSnapshots.push_back(snap);
     }
 
     g.ViewStack.push_back(frame);
@@ -6026,18 +6054,24 @@ void ImGui::PopView()
     const float  s  = frame.LocalToParentScale;
     const ImVec2 o  = frame.LocalToParentOffset;
 
-    // Build a map from snapshotted draw list to its baseline sizes for O(N)
-    // pass over the current draw list set. The number of draw lists is
-    // typically tiny (a handful of windows plus 0-2 bg/fg lists), so a
-    // linear scan is fine.
+    // Snapshot range in the flat arena: [snap_begin .. snap_end).
+    const int snap_begin = frame.SnapshotsBegin;
+    const int snap_end   = g.ViewStackSnapshots.Size;
+
+    // Walk every currently-active draw list. Lists with no snapshot in our
+    // range (i.e. created during the scope) get an implicit base of {0,0}
+    // and have their entire current buffer transformed.
     ImVector<ImDrawList*> draw_lists;
-    ImGui_CollectActiveDrawLists(g, draw_lists);
+    ImGui_CollectActiveDrawLists(g, draw_lists, /*snapshot_only=*/false);
     for (ImDrawList* dl : draw_lists)
     {
         int base_vtx = 0;
         int base_cmd = 0;
-        for (const ImGuiViewDrawListSnapshot& snap : frame.DrawListSnapshots)
+        for (int i = snap_begin; i < snap_end; i++)
+        {
+            const ImGuiViewDrawListSnapshot& snap = g.ViewStackSnapshots[i];
             if (snap.DrawList == dl) { base_vtx = snap.VtxSize; base_cmd = snap.CmdSize; break; }
+        }
 
         // Forward-map vertices added during the scope.
         ImDrawVert* verts = dl->VtxBuffer.Data;
@@ -6062,6 +6096,7 @@ void ImGui::PopView()
         }
     }
 
+    g.ViewStackSnapshots.resize(snap_begin);
     g.ViewStack.pop_back();
 }
 

@@ -1460,13 +1460,20 @@ struct ImGuiViewDrawListSnapshot
 // it maps vertex coordinates back into the parent frame's space (or screen
 // space if this is the outermost view). Composed values are cached for
 // O(1) access from GetViewScale()/GetViewOffset().
+//
+// DrawListSnapshots for this frame are stored in the flat
+// g.ViewStackSnapshots arena, from SnapshotsBegin (inclusive) up to either
+// the next frame's SnapshotsBegin or the arena's end. We can't keep an
+// ImVector inside this struct because g.ViewStack itself is an ImVector and
+// its element-copy is a memcpy that shallow-shares the inner buffer
+// (causing double-free / dangling pointers).
 struct ImGuiViewStackFrame
 {
     float           LocalToParentScale;
     ImVec2          LocalToParentOffset;
     float           ComposedScale;
     ImVec2          ComposedOffset;
-    ImVector<ImGuiViewDrawListSnapshot> DrawListSnapshots;
+    int             SnapshotsBegin;     // index into g.ViewStackSnapshots
 };
 
 // Data saved for each window pushed into the stack
@@ -2364,6 +2371,7 @@ struct ImGuiContext
     ImVector<ImGuiPopupData>        BeginPopupStack;            // Which level of BeginPopup() we are in (reset every frame)
     ImVector<ImGuiTreeNodeStackData>TreeNodeStack;              // Stack for TreeNode()
     ImVector<ImGuiViewStackFrame>   ViewStack;                  // Stack for PushView()/PopView() — applies scale+translate to widget geometry
+    ImVector<ImGuiViewDrawListSnapshot> ViewStackSnapshots;     // Flat arena of per-draw-list snapshots, sliced by ViewStack[i].SnapshotsBegin
 
     // Viewports
     ImVector<ImGuiViewportP*> Viewports;                        // Active viewports (Size==1 in 'master' branch). Each viewports hold their copy of ImDrawData.
