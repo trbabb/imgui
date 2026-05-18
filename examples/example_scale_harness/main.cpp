@@ -146,9 +146,10 @@ static int RunInteractive()
     // Live-editable view transform applied to the widget zoo. The control
     // panel itself is drawn OUTSIDE the PushView scope so the user can
     // always reach it regardless of how extreme the scale gets.
-    float  view_scale  = 1.0f;
-    ImVec2 view_pivot  = ImVec2(400.0f, 300.0f);
-    bool   view_enable = true;
+    float  view_scale         = 1.0f;
+    ImVec2 view_pivot_manual  = ImVec2(400.0f, 300.0f);
+    bool   view_enable        = true;
+    bool   pivot_on_cursor    = true;   // good default: zoom around the mouse cursor
 
     while (!glfwWindowShouldClose(window))
     {
@@ -158,21 +159,27 @@ static int RunInteractive()
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        const ImVec2 pivot = pivot_on_cursor ? ImGui::GetIO().MousePos : view_pivot_manual;
+
         // Control panel (always at identity).
         ImGui::SetNextWindowPos(ImVec2(800, 20), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(360, 200), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(360, 220), ImGuiCond_FirstUseEver);
         ImGui::Begin("View Controls");
         ImGui::Checkbox("Apply view transform", &view_enable);
-        ImGui::SliderFloat("scale",  &view_scale,    0.25f, 4.0f, "%.3f");
-        ImGui::SliderFloat("pivot.x",&view_pivot.x,  0.0f, 1280.0f, "%.0f");
-        ImGui::SliderFloat("pivot.y",&view_pivot.y,  0.0f,  800.0f, "%.0f");
+        ImGui::SliderFloat("scale", &view_scale, 0.25f, 4.0f, "%.3f");
+        ImGui::Checkbox("Pivot on cursor", &pivot_on_cursor);
+        ImGui::BeginDisabled(pivot_on_cursor);
+        ImGui::SliderFloat("pivot.x", &view_pivot_manual.x, 0.0f, 1280.0f, "%.0f");
+        ImGui::SliderFloat("pivot.y", &view_pivot_manual.y, 0.0f,  800.0f, "%.0f");
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("active pivot: (%.0f, %.0f)", pivot.x, pivot.y);
         ImGui::TextDisabled("composed: scale=%.3f offset=(%.1f, %.1f)",
                             ImGui::GetViewScale(), ImGui::GetViewOffset().x, ImGui::GetViewOffset().y);
         ImGui::TextDisabled("(PR 1: visual only — hit-test stays unscaled)");
         ImGui::End();
 
         if (view_enable && view_scale != 1.0f)
-            ImGui::PushView(view_scale, view_pivot);
+            ImGui::PushView(view_scale, pivot);
         ScaleHarness::RenderWidgetZoo();
         if (view_enable && view_scale != 1.0f)
             ImGui::PopView();
