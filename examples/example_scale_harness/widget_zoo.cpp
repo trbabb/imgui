@@ -2,6 +2,7 @@
 
 #include "widget_zoo.h"
 #include "imgui.h"
+#include <cstdio>
 
 namespace ScaleHarness {
 
@@ -10,10 +11,13 @@ namespace ScaleHarness {
 // same draw data.
 void RenderWidgetZoo()
 {
-    // Anchor the window to a known position/size so headless renders are
-    // reproducible regardless of .ini state.
-    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(420, 540), ImGuiCond_Always);
+    // Seed a known position/size on first use so headless renders are
+    // reproducible. FirstUseEver (not Always) lets the user move/resize
+    // the window in interactive mode; the headless harness sets
+    // io.IniFilename = nullptr so a fresh process always starts from these
+    // values.
+    ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(420, 540), ImGuiCond_FirstUseEver);
     ImGui::Begin("Widget Zoo", nullptr, ImGuiWindowFlags_NoSavedSettings);
 
     ImGui::TextUnformatted("Plain text line.");
@@ -67,16 +71,28 @@ void RenderWidgetZoo()
         ImGui::TreePop();
     }
 
+    static float drag_value = 0.5f;
+    ImGui::DragFloat("drag", &drag_value, 0.01f, 0.0f, 1.0f);
+
     ImGui::Separator();
 
-    // Small scrollable child to exercise clip rects and scrollbars.
+    // Scrollable child with selectable rows. Exercises clip rects, scrollbars,
+    // and gives interactive hit-test targets inside a sub-region (useful when
+    // we start scaling and need to verify clicks inside child windows).
     ImGui::BeginChild("scroll_child", ImVec2(0, 120), ImGuiChildFlags_Borders);
+    static int selected_row = -1;
     for (int i = 0; i < 20; i++)
-        ImGui::Text("scroll line %d", i);
+    {
+        char label[32];
+        std::snprintf(label, sizeof(label), "scroll line %d", i);
+        if (ImGui::Selectable(label, selected_row == i))
+            selected_row = i;
+    }
     ImGui::EndChild();
 
-    // ProgressBar exercises rect drawing + text overlay.
-    ImGui::ProgressBar(0.65f, ImVec2(-1, 0), "65%");
+    // Display-only progress bar. Not interactive by design — included to
+    // exercise rect drawing + text overlay rather than as a hit-test target.
+    ImGui::ProgressBar(0.65f, ImVec2(-1, 0), "progress 65%");
 
     ImGui::End();
 }
